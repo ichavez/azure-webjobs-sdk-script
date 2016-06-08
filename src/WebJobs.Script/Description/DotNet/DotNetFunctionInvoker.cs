@@ -378,7 +378,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             foreach (var binding in bindings)
             {
-                if (binding.Metadata.Type == BindingType.Http)
+                if (string.Compare("http", binding.Metadata.Type, StringComparison.OrdinalIgnoreCase) == 0)
                 {
                     continue;
                 }

@@ -5,6 +5,7 @@ using System;
 using System.Collections.ObjectModel;
 using System.IO;
 using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Script.Extensibility;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
@@ -15,7 +16,7 @@ namespace Microsoft.Azure.WebJobs.Script
             HostConfig = new JobHostConfiguration();
             FileWatchingEnabled = true;
             RootScriptPath = Environment.CurrentDirectory;
-            RootLogPath = Path.Combine(Path.GetTempPath(), "Functions");            
+            RootLogPath = Path.Combine(Path.GetTempPath(), "Functions");
         }
 
         /// <summary>
@@ -60,5 +61,8 @@ namespace Microsoft.Azure.WebJobs.Script
         /// be run.
         /// </summary>
         public Collection<string> Functions { get; set; }
+
+        [CLSCompliant(false)]
+        public Collection<ScriptBindingProvider> BindingProviders { get; internal set; }
     }
 }

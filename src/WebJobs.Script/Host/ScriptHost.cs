@@ -17,7 +17,7 @@ using Microsoft.Azure.WebJobs.Host.Indexers;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
-using Microsoft.Azure.WebJobs.ServiceBus;
+using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -221,7 +221,11 @@ namespace Microsoft.Azure.WebJobs.Script
 
             ScriptConfig.HostConfig.TypeLocator = new TypeLocator(types);
 
-            ApplyBindingConfiguration(functions, ScriptConfig.HostConfig);
+            // Allow BindingProviders to complete their registrations
+            foreach (var provider in ScriptConfig.BindingProviders)
+            {
+                provider.Initialize(TraceWriter, hostConfig);
+            }
 
             Functions = functions;
 
@@ -294,6 +298,8 @@ namespace Microsoft.Azure.WebJobs.Script
                 scriptConfig.RootScriptPath = Path.Combine(Environment.CurrentDirectory, scriptConfig.RootScriptPath);
             }
 
+            LoadExtensions(scriptConfig);
+
             ScriptHost scriptHost = new ScriptHost(scriptConfig);
             try
             {
@@ -309,6 +315,40 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             return scriptHost;
+        }
+
+        private static void LoadExtensions(ScriptHostConfiguration scriptConfig)
+        {
+            // Register our built in extensions
+            var hostConfig = scriptConfig.HostConfig;
+            scriptConfig.BindingProviders = new Collection<ScriptBindingProvider>()
+            {
+                new WebJobsCoreScriptBindingProvider(hostConfig),
+                new ServiceBusScriptBindingProvider(hostConfig),
+                new CoreExtensionsScriptBindingProvider(hostConfig),
+            };
+
+            // Dynamically load any additional registered extensions
+            // TODO: Determine the registration model (where we get candidate assemblies)
+            string[] extensionAssemblies = new string[]
+            {
+                "Microsoft.Azure.WebJobs.Extensions.ApiHub",
+                "Microsoft.Azure.WebJobs.Extensions.DocumentDB",
+                "Microsoft.Azure.WebJobs.Extensions.MobileApps",
+                "Microsoft.Azure.WebJobs.Extensions.NotificationHubs"
+            };
+            foreach (var assemblyName in extensionAssemblies)
+            {
+                Assembly assembly = Assembly.Load(assemblyName);
+                if (assembly != null)
+                {
+                    foreach (var type in assembly.GetExportedTypes().Where(t => typeof(ScriptBindingProvider).IsAssignableFrom(t)))
+                    {
+                        var provider = (ScriptBindingProvider)Activator.CreateInstance(type, new object[] { hostConfig });
+                        scriptConfig.BindingProviders.Add(provider);
+                    }
+                }
+            }
         }
 
         private static FunctionMetadata ParseFunctionMetadata(string functionName, INameResolver nameResolver, JObject configMetadata)
@@ -354,7 +394,7 @@ namespace Microsoft.Azure.WebJobs.Script
             string bindingTypeValue = (string)binding["type"];
             string bindingDirectionValue = (string)binding["direction"];
             string connection = (string)binding["connection"];
-            BindingType bindingType = default(BindingType);
+            string bindingType = (string)binding["type"];
             BindingDirection bindingDirection = default(BindingDirection);
 
             if (!string.IsNullOrEmpty(bindingDirectionValue) &&
@@ -363,11 +403,7 @@ namespace Microsoft.Azure.WebJobs.Script
                 throw new FormatException(string.Format(CultureInfo.InvariantCulture, "'{0}' is not a valid binding direction.", bindingDirectionValue));
             }
 
-            if (!string.IsNullOrEmpty(bindingTypeValue) &&
-                !Enum.TryParse<BindingType>(bindingTypeValue, true, out bindingType))
-            {
-                throw new FormatException(string.Format("'{0}' is not a valid binding type.", bindingTypeValue));
-            }
+            // TODO: Validate the binding type somehow?
 
             if (!string.IsNullOrEmpty(connection) && 
                 string.IsNullOrEmpty(Utility.GetAppSettingOrEnvironmentValue(connection)))
@@ -375,54 +411,23 @@ namespace Microsoft.Azure.WebJobs.Script
                 throw new FormatException("Invalid Connection value specified.");
             }
 
-            switch (bindingType)
+            switch (bindingType.ToLowerInvariant())
             {
-                case BindingType.EventHubTrigger:
-                case BindingType.EventHub:
-                    bindingMetadata = binding.ToObject<EventHubBindingMetadata>();
-                    break;
-                case BindingType.QueueTrigger:
-                case BindingType.Queue:
-                    bindingMetadata = binding.ToObject<QueueBindingMetadata>();
-                    break;
-                case BindingType.BlobTrigger:
-                case BindingType.Blob:
-                    bindingMetadata = binding.ToObject<BlobBindingMetadata>();
-                    break;
-                case BindingType.ServiceBusTrigger:
-                case BindingType.ServiceBus:
-                    bindingMetadata = binding.ToObject<ServiceBusBindingMetadata>();
-                    break;
-                case BindingType.HttpTrigger:
+                case "httptrigger":
                     bindingMetadata = binding.ToObject<HttpTriggerBindingMetadata>();
                     break;
-                case BindingType.Http:
+                case "http":
                     bindingMetadata = binding.ToObject<HttpBindingMetadata>();
                     break;
-                case BindingType.Table:
+                case "table":
                     bindingMetadata = binding.ToObject<TableBindingMetadata>();
                     break;
-                case BindingType.ManualTrigger:
+                case "manualtrigger":
                     bindingMetadata = binding.ToObject<BindingMetadata>();
                     break;
-                case BindingType.TimerTrigger:
-                    bindingMetadata = binding.ToObject<TimerBindingMetadata>();
-                    break;
-                case BindingType.MobileTable:
-                    bindingMetadata = binding.ToObject<MobileTableBindingMetadata>();
-                    break;
-                case BindingType.DocumentDB:
-                    bindingMetadata = binding.ToObject<DocumentDBBindingMetadata>();
-                    break;
-                case BindingType.NotificationHub:
-                    bindingMetadata = binding.ToObject<NotificationHubBindingMetadata>();
-                    break;
-                case BindingType.ApiHubFile:
-                case BindingType.ApiHubFileTrigger:
-                    bindingMetadata = binding.ToObject<ApiHubBindingMetadata>();
-                    break;
-                case BindingType.ApiHubTable:
-                    bindingMetadata = binding.ToObject<ApiHubTableBindingMetadata>();
+                default:
+                    // TEMP - Still require a BindingMetadata until refactoring is complete
+                    bindingMetadata = binding.ToObject<BindingMetadata>();
                     break;
             }
 
@@ -431,6 +436,21 @@ namespace Microsoft.Azure.WebJobs.Script
             bindingMetadata.Connection = connection;
 
             nameResolver.ResolveAllProperties(bindingMetadata);
+
+            // TEMP - We want to pass resolved metadata values into
+            // binding extensions
+            JObject resolved = new JObject(binding);
+            foreach (JProperty property in resolved.Properties().ToArray())
+            {
+                if (property.Value != null &&
+                    property.Value.Type == JTokenType.String)
+                {
+                    string val = (string)property.Value;
+                    string newVal = nameResolver.ResolveWholeString(val);
+                    resolved[property.Name] = newVal;
+                }
+            }
+            bindingMetadata.Raw = resolved;
 
             return bindingMetadata;
         }
@@ -688,17 +708,17 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             // Apply ServiceBus configuration
-            ServiceBusConfiguration serviceBusConfig = new ServiceBusConfiguration();
-            configSection = (JObject)config["serviceBus"];
-            value = null;
-            if (configSection != null)
-            {
-                if (configSection.TryGetValue("maxConcurrentCalls", out value))
-                {
-                    serviceBusConfig.MessageOptions.MaxConcurrentCalls = (int)value;
-                }
-            }
-            hostConfig.UseServiceBus(serviceBusConfig);
+            //ServiceBusConfiguration serviceBusConfig = new ServiceBusConfiguration();
+            //configSection = (JObject)config["serviceBus"];
+            //value = null;
+            //if (configSection != null)
+            //{
+            //    if (configSection.TryGetValue("maxConcurrentCalls", out value))
+            //    {
+            //        serviceBusConfig.MessageOptions.MaxConcurrentCalls = (int)value;
+            //    }
+            //}
+            //hostConfig.UseServiceBus(serviceBusConfig);
 
             // Apply Tracing/Logging configuration
             configSection = (JObject)config["tracing"];
@@ -718,29 +738,11 @@ namespace Microsoft.Azure.WebJobs.Script
                     scriptConfig.FileLoggingEnabled = (bool)value;
                 }
             }
-
-            hostConfig.UseTimers();
-            hostConfig.UseCore();
         }
 
         private void OnUnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
             HandleHostError((Exception)e.ExceptionObject);
-        }
-
-        // Bindings may require us to update JobHostConfiguration. 
-        private void ApplyBindingConfiguration(Collection<FunctionDescriptor> functions, JobHostConfiguration hostConfig)
-        {
-            JobHostConfigurationBuilder builder = new JobHostConfigurationBuilder(hostConfig, TraceWriter);
-
-            foreach (var func in functions)
-            {
-                foreach (var metadata in func.Metadata.InputBindings.Concat(func.Metadata.OutputBindings))
-                {
-                    metadata.ApplyToConfig(builder);
-                }
-            }
-            builder.Done();
         }
 
         private void HandleHostError(Microsoft.Azure.WebJobs.Extensions.TraceFilter traceFilter)
